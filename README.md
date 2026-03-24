@@ -4,6 +4,35 @@
 
 ---
 
+**1. 背景与痛点 (Background & Bottleneck)**
+在现有的 MTP (Multi-Token Prediction) 投机解码方案中，通常采用固定的投机步长 (`spec_steps`)。主模型基于 MTP Head 连续生成的 `spec_steps` 个 Draft Tokens 进行 Prefill 并行验证。
+* **痛点**：固定步长导致严重的资源错配。
+    * **步长过长**：尾部 Draft Tokens 接受率极低，造成主模型 Prefill 阶段无谓的算力与显存带宽浪费。
+    * **步长过短**：在模型具有高确定性时，无法充分释放 Speculative Decoding 的加速潜力。
+
+**2. 核心改进：引入 Stop-Head 实现动态步长**
+为了解决固定步长带来的浪费，我们在 MTP 架构中引入了一个轻量级的 `Stop-Head`，用于提前预测当前 Draft Token 是否会被主模型接受，从而实现动态截断。
+
+**3. 优化流水线：并发执行掩盖预测开销 (Optimized Pipeline)**
+考虑到逐 Token 预测会引入不可忽视的串行延迟（Overhead），我们设计了基于特定步长的并发流水线。以最大 `spec_steps = 4` 为例，具体执行流如下：
+
+* **阶段一：初始 Draft 生成**
+    * MTP Head 连续生成第 1、第 2 个 Draft Tokens ($D_1, D_2$)。
+* **阶段二：并发预测与生成 (核心优化)**
+    * 获取 $D_2$ 后，系统分离出两个并发的 CUDA Stream：
+        * *Stream A (预测)*：使用 `Stop-Head` 评估是否应该在 $D_2$ 处截断投机。
+        * *Stream B (生成)*：MTP Head 继续无阻塞生成第 3、第 4 个 Draft Tokens ($D_3, D_4$)。
+* **阶段三：条件验证 (Conditional Verification)**
+    * 等待阶段二的并发任务完成，根据 `Stop-Head` 的预测结果动态构建主模型的 Verify 队列：
+        * **情况 A (预测停止)**：若 `Stop-Head` 判定在 $D_2$ 停止，则丢弃后续生成，主模型仅对 $[D_1]$ 进行 Verify。
+        * **情况 B (预测继续)**：若判定继续，主模型对全量 Draft Tokens $[D_1, D_2, D_3, D_4]$ 进行 Verify。
+
+**4. vLLM 实施收益**
+* **降低开销**：通过并发掩盖了 `Stop-Head` 的推理延迟。
+* **提升吞吐**：大幅减少主模型在低接受率场景下的无效 Prefill 计算，提升整体系统的 Throughput 与 Token/s。
+  
+---
+
 ## 1. `EagleProposer` 中的关键行为
 ### 1.1 Stop Head 仅作用于读取speculative_config model参数路径去下的权重中有 adapter key的情况：
 拿Qwen3-8B Eagle3举例：
